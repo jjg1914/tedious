@@ -14,13 +14,13 @@ const Request = require('./request');
 const RpcRequestPayload = require('./rpcrequest-payload');
 const SqlBatchPayload = require('./sqlbatch-payload');
 const MessageIO = require('./message-io');
-const Socket = require('net').Socket;
 const TokenStreamParser = require('./token/token-stream-parser').Parser;
 const Transaction = require('./transaction').Transaction;
 const ISOLATION_LEVEL = require('./transaction').ISOLATION_LEVEL;
 const crypto = require('crypto');
 const ConnectionError = require('./errors').ConnectionError;
 const RequestError = require('./errors').RequestError;
+const Connector = require('./connector').Connector;
 
 // A rather basic state machine for managing a connection.
 // Implements something approximating s3.2.1.
@@ -373,7 +373,7 @@ class Connection extends EventEmitter {
 
   connect() {
     if (this.config.options.port) {
-      return this.connectOnPort(this.config.options.port);
+      return this.connectOnPort(this.config.options.port, this.config.options.multiSubnetFailover);
     } else {
       return instanceLookup(this.config.server, this.config.options.instanceName, (message, port) => {
         if (this.state === this.STATE.FINAL) {
@@ -382,32 +382,35 @@ class Connection extends EventEmitter {
         if (message) {
           return this.emit('connect', ConnectionError(message, 'EINSTLOOKUP'));
         } else {
-          return this.connectOnPort(port);
+          return this.connectOnPort(port, this.config.options.multiSubnetFailover);
         }
       }, this.config.options.connectTimeout);
     }
   }
 
-  connectOnPort(port) {
-    this.socket = new Socket({});
+  connectOnPort(port, multiSubnetFailover) {
     const connectOpts = {
       host: this.routingData ? this.routingData.server : this.config.server,
-      port: this.routingData ? this.routingData.port : port
+      port: this.routingData ? this.routingData.port : port,
+      localAddress: this.config.options.localAddress
     };
-    if (this.config.options.localAddress) {
-      connectOpts.localAddress = this.config.options.localAddress;
-    }
-    this.socket.connect(connectOpts);
-    this.socket.on('error', this.socketError);
-    this.socket.on('connect', this.socketConnect);
-    this.socket.on('close', this.socketClose);
-    this.socket.on('end', this.socketEnd);
-    this.messageIo = new MessageIO(this.socket, this.config.options.packetSize, this.debug);
-    this.messageIo.on('data', (data) => { this.dispatchEvent('data', data); });
-    this.messageIo.on('message', () => {
-      return this.dispatchEvent('message');
+
+    new Connector(connectOpts, multiSubnetFailover).execute((err, socket) => {
+      if (err) {
+        return this.socketError(err);
+      }
+
+      this.socket = socket;
+      this.socket.on('error', this.socketError);
+      this.socket.on('close', this.socketClose);
+      this.socket.on('end', this.socketEnd);
+      this.messageIo = new MessageIO(this.socket, this.config.options.packetSize, this.debug);
+      this.messageIo.on('data', (data) => { this.dispatchEvent('data', data); });
+      this.messageIo.on('message', () => { this.dispatchEvent('message'); });
+      this.messageIo.on('secure', this.emit.bind(this, 'secure'));
+
+      this.socketConnect();
     });
-    return this.messageIo.on('secure', this.emit.bind(this, 'secure'));
   }
 
   closeConnection() {
